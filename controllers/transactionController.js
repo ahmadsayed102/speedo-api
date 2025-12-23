@@ -5,9 +5,10 @@ const User = require('../models/User')
 
 exports.transaction = async (req, res, next) => {
     let log = true
-    const sess = await mongoose.startSession();
+    const session = await mongoose.startSession();
     try {
-        const { fromAcct, toAcct, amount } = req.body;
+        const { fromAcct, toAcct, amount : rawAmount } = req.body;
+        const amount = Number(rawAmount)
         const id = req.userId
         const user = await User.findById(id).populate('accounts')
         if (!user) {
@@ -15,67 +16,66 @@ exports.transaction = async (req, res, next) => {
             error.status = 404;
             return next(error);
         }
-        const hisAccount = user.accounts.some(account => account.accountNumber === fromAcct)
+        const hisAccount = user.accounts.some(
+            account => String(account.accountNumber) === fromAcct)
         if (!hisAccount) {
             const error = new Error(`Invalid transaction`);
             error.status = 401;
             return next(error);
         }
 
-        await sess.withTransaction(async () => {
+        await session.withTransaction(async () => {
             const sender = await Account.findOne({ accountNumber: fromAcct })
-                .session(sess);
+                .session(session);
             if (!sender || !sender.active) {
                 const err = new Error('Invalid or inactive sender account');
                 err.status = 404;
                 throw err;
             }
-
-            const recipient = await Account.findOne({ accountNumber: toAcct })
-                .session(sess);
-            if (!recipient || !recipient.active) {
-                const err = new Error('Invalid or inactive recipient account');
-                err.status = 404;
-                throw err;
-            }
-
             if (sender.balance < amount) {
                 log = false
                 const err = new Error('Insufficient funds');
                 err.status = 400;
                 throw err;
             }
-
-            sender.balance -= amount;
-            recipient.balance += amount;
-            await sender.save({ session: sess });
-            await recipient.save({ session: sess });
-
-            const txn = await Transaction.create([{
+            const recipient = await Account.findOne({ accountNumber: toAcct })
+                .session(session);
+            if (!recipient || !recipient.active) {
+                const err = new Error('Invalid or inactive recipient account');
+                err.status = 404;
+                throw err;
+            }
+            const [txn] = await Transaction.create([{
                 senderAccount: fromAcct,
                 recipientAccount: toAcct,
                 amount,
                 success: true
-            }], { session: sess });
+            }], { session: session });
 
-            sender.transactions.push(txn[0]._id);
-            recipient.transactions.push(txn[0]._id);
-            await sender.save({ session: sess });
-            await recipient.save({ session: sess });
+            const senderUpdate = await Account.updateOne(
+                { _id: sender._id, balance: { $gte: amount }, active: true },
+                { $inc: { balance: -amount }, $push: { transactions: txn._id } },
+                { session: session })
+
+            if (senderUpdate.modifiedCount === 0) {
+                log = false;
+                await Transaction.updateOne({ _id: txn._id }, { success: false }, { session });
+                const err = new Error('Insufficient funds or invalid sender');
+                err.status = 404;
+                throw err;
+            }
+
+            await Account.updateOne(
+                { _id: recipient._id, active: true },
+                { $inc: { balance: amount }, $push: { transactions: txn._id } },
+                { session: session }
+            )
         });
 
-        sess.endSession();
+        session.endSession();
         return res.status(200).json({ message: 'Transfer successful' });
     } catch (err) {
-        //await sess.abortTransaction(); 
-        sess.endSession();
-        if (log)
-            await Transaction.create({
-                senderAccount: req.body.fromAcct,
-                recipientAccount: req.body.toAcct,
-                amount: req.body.amount,
-                success: false
-            });
+        session.endSession();
         return next(err);
     }
 };
@@ -91,7 +91,8 @@ exports.updateBalance = async (req, res, next) => {
             error.status = 404
             throw error
         }
-        const sameAccount = user.accounts.some(account => account.accountNumber = accountNum)
+        const sameAccount = user.accounts.some(account =>
+            String(account.accountNumber) === accountNum)
         if (!sameAccount) {
             const error = new Error("Can't update this account")
             error.status = 401
